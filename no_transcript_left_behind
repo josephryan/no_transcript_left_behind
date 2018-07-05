@@ -1,0 +1,725 @@
+#!/usr/bin/perl
+
+# PREREQUISITES:
+# BLAST+
+# JFR::Fasta https://github.com/josephryan/JFR-PerlModules
+
+# this version runs to completion
+# the results did not make sense
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+$|++;
+our $VERSION = 0.17;
+
+use strict;
+use warnings;
+use autodie;
+use Storable;
+use Getopt::Long;
+use Pod::Usage;
+use JFR::Fasta;
+use Data::Dumper;
+
+# SET THIS TO WHERE alien_index_print_hit IS INSTALLED (distributed w/ this script)
+our $ALIEN_INDEX = './alien_index_print_hit';
+
+# DEFAULTS
+our $DF_JOINDIST = 10000;
+our $DF_END_PAD = 2000;
+our $DF_MAX_P_DUPS = 0.0;
+our $DF_AI_CUT = 45;
+our $DF_MAX_OOM_DIFF = 1;
+our $DF_THREADS = 1;
+
+our @CONTIGS_W_NO_TRANSCRIPTS = (); # add_to_ti routine will populate this
+
+MAIN: {
+    #OPTIONS
+    my $rh_o = process_options();
+    our $max_p_dups = $ARGV[1];
+
+    #VARIABLES
+    my %primary  = (); # used to store primary contig ids
+    my %rejected = (); # used to store rejected contig ids
+
+    my ($rh_fa,$rh_ctglens) = get_fa_lens($rh_o->{'ctg_fa'});
+    print_key_count($rh_fa,'$rh_fa') if ($rh_o->{'debug'});
+    print_key_count($rh_ctglens,'$rh_ctglens') if ($rh_o->{'debug'});
+    get_size_sorted_unique_set($rh_fa,\%primary,\%rejected,$max_p_dups,$rh_o);
+    print_key_count(\%primary,'\%primary') if ($rh_o->{'debug'});
+    print_key_count(\%rejected,'\%rejected') if ($rh_o->{'debug'});
+    write_init_prim_rej_fasta(\%primary,\%rejected,$rh_fa,$rh_o->{'name'});
+
+    my ($rh_top_ctigs,$rh_low_ctigs) = run_alien_index(\%primary,\%rejected,$rh_fa,$rh_o);
+    print_key_count($rh_top_ctigs,'$rh_top_ctigs') if ($rh_o->{'debug'});
+    print_key_count($rh_low_ctigs,'$rh_low_ctigs') if ($rh_o->{'debug'});
+    add_back_partials($rh_o->{'name'},$rh_fa,$rh_top_ctigs,$rh_ctglens);
+}
+
+sub add_back_partials {
+    my $fname        = shift;
+    my $rh_fa        = shift;
+    my $rh_top_ctigs = shift;
+    my $rh_ctglens   = shift;
+    my $rh_o         = shift;
+
+    my $rh_bl_boundaries = get_bl_boundaries("$fname.ai.blastn");
+    my $rh_dat = expand_boundaries($rh_bl_boundaries,$rh_top_ctigs);   
+    my ($rh_orig_fa,$rh_orig_lens) = get_fa_lens("$fname.fa");
+    my ($rh_rej_fa,$rh_rejlens) = get_fa_lens("$fname.rejected.fa");
+    my $rh_chunks = get_chunks($rh_dat,$rh_ctglens);
+    my $rh_prim = get_seqs($rh_chunks,$rh_fa,$rh_ctglens,$rh_orig_fa,$rh_o);
+    my $rh_rej  = get_rejected($rh_rej_fa,$rh_prim,$rh_rejlens);
+    open(my $ppfh, ">", "$fname.final.fa");
+    open(my $rrfh, ">", "$fname.final.rejected.fa");
+    print_fasta_direct($rh_prim,$ppfh);
+    print_fasta_direct($rh_rej,$rrfh);
+    debug($rh_bl_boundaries, $rh_dat, $rh_rej_fa, $rh_rejlens, $rh_orig_fa, $rh_orig_lens, $rh_chunks, $rh_prim, $rh_rej) if ($rh_o->{'debug'});
+}
+
+# use alien index to identify contigs in rejected that are not in primary
+# if there are a 
+sub run_alien_index {
+    my $rh_prim = shift;
+    my $rh_rej  = shift;
+    my $rh_fa   = shift;
+    my $rh_o    = shift;
+
+    my $fname   = $rh_o->{'name'};
+    my $transcriptome = $rh_o->{'transcriptome'};
+
+    open(my $afh, ">", "$fname.ai.fa");
+    print_ai_fasta($rh_prim,$rh_rej,$rh_fa,$afh);
+
+    print "5 (running alien index)\n" if ($rh_o->{'verbose'});
+    alien_index("$fname.ai.fa",$transcriptome,$fname,$rh_o->{'threads'});
+
+    print "6 (getting missed chunks)\n" if ($rh_o->{'verbose'});
+    my ($rh_top_ctigs,$rh_low_ctigs) = get_ctigs_w_aliens("$fname.ai",$rh_o);
+}
+
+sub write_init_prim_rej_fasta {
+    my $rh_prim = shift;
+    my $rh_rej  = shift;
+    my $rh_fa   = shift;
+    my $fname   = shift;
+
+    open(my $pfh, ">", "$fname.fa");
+    print_fasta($rh_prim,$rh_fa,$pfh);
+    open(my $rfh, ">", "$fname.rejected.fa");
+    print_fasta($rh_rej,$rh_fa,$rfh);
+}
+
+
+sub get_size_sorted_unique_set {
+    my $rh_fa      = shift;
+    my $rh_prim    = shift;
+    my $rh_rej     = shift;
+    my $max_p_dups = shift;
+    my $rh_o       = shift;
+
+    my ($ra_blast,$rh_ctg_ts) = get_blast_array($rh_o); 
+    my %ts_inc   = (); # used to store transcripts that have been included
+
+    my @sorted_ids = sort {length($rh_fa->{$b}) <=> length($rh_fa->{$a})} 
+                     keys %{$rh_fa};
+    my $longest_id = shift @sorted_ids;
+    add_longest_contig($ra_blast,$rh_ctg_ts,$longest_id,$rh_prim,\%ts_inc);
+    foreach my $ctg_id (@sorted_ids) {
+        add_contig_if_uniq($ra_blast,$rh_ctg_ts,$ctg_id,$rh_prim,\%ts_inc,$rh_rej,$max_p_dups);
+    }
+}
+
+# $rh_dat is tophits from alien_index w/expanded boundaries from BLAST
+# $rh_ctglens is lengths of each contig
+# %chunks is essentially each hit on that contig, but if hits are close
+#   to each other or the end of contig they are merged
+sub get_chunks {
+    my $rh_dat     = shift;
+    my $rh_ctglens = shift;
+    my $rh_o       = shift;
+
+    my %chunks = ();
+    my $join_dist = $rh_o->{'join_dist'};
+
+    CTG: foreach my $ctgid (keys %{$rh_dat}) {
+        $ctgid =~ s/^ALIEN_//;
+        my $pre_high = '';
+        foreach my $tsid (sort {$rh_dat->{$ctgid}->{$a}->[0] <=> $rh_dat->{$ctgid}->{$b}->[0] } keys %{$rh_dat->{$ctgid}}) {
+            my $low = $rh_dat->{$ctgid}->{$tsid}->[0];
+            my $high = $rh_dat->{$ctgid}->{$tsid}->[1];
+            if ($pre_high) {
+                if ( ($low - $pre_high) <= $join_dist ) {
+                    if (within_jdist_from_three_prime($rh_ctglens->{$ctgid},$high,$join_dist)) {
+                        $chunks{$ctgid}->[-1]->[1] = $rh_ctglens->{$ctgid};
+                    } else {
+                        $chunks{$ctgid}->[-1]->[1] = $high;
+                    }
+                } else {
+                    if (within_jdist_from_three_prime($rh_ctglens->{$ctgid},$high,$join_dist)) {
+                        push @{$chunks{$ctgid}},[$low,$rh_ctglens->{$ctgid}];
+                        next CTG;
+                    } else {
+                        push @{$chunks{$ctgid}},[$low,$high];
+                    }
+                }
+            } else {
+                if ($low < $join_dist) {
+                    $low = 1;
+                }
+                die "unexpected:\$ctgid=$ctgid" unless ($rh_ctglens->{$ctgid});
+                if (within_jdist_from_three_prime($rh_ctglens->{$ctgid},$high,$join_dist)) {
+                    push @{$chunks{$ctgid}},[$low,$rh_ctglens->{$ctgid}];
+                    next CTG;
+                }
+                push @{$chunks{$ctgid}},[$low,$high];
+            }
+            $pre_high = $high;
+        }
+    }
+    return \%chunks;
+}
+
+# accepts a fasta file
+# returns one hash with ids as keys and sequences as values
+# returns another hash with ids as keys and seq_lengths as values
+sub get_fa_lens {
+    my $fa   = shift;
+    my %seq  = ();
+    my %lens = ();
+    my $fp = JFR::Fasta->new($fa);
+    while (my $rec = $fp->get_record()) {
+        my $id = JFR::Fasta->get_def_w_o_gt($rec->{'def'});
+        $id =~ s/ALIEN_UNFILT_//;
+        $id =~ s/ALIEN_NEITHER_//;
+        $id =~ s/ALIEN_//;
+        $lens{$id} = length($rec->{'seq'});
+        $seq{$id} = $rec->{'seq'};
+    }
+    return (\%seq,\%lens);
+}
+
+# accepts $rh_bl - expanded BLAST boundaries
+# accepts $rh_ct - top contigs from alien index
+# applies expanded boundaries of $rh_bl to $rh_ct and returns new hash
+sub expand_boundaries {
+    my $rh_bl = shift;
+    my $rh_ct = shift;
+    my %dat   = ();
+    foreach my $ctgid (keys %{$rh_ct}) {
+        foreach my $tsid (keys %{$rh_ct->{$ctgid}}) {
+            if ($rh_bl->{$ctgid}->{$tsid} && $rh_bl->{$ctgid}->{$tsid}->[0] < $rh_ct->{$ctgid}->{$tsid}->[0]) {
+                $dat{$ctgid}->{$tsid}->[0] = $rh_bl->{$ctgid}->{$tsid}->[0];
+            } else {
+                $dat{$ctgid}->{$tsid}->[0] = $rh_ct->{$ctgid}->{$tsid}->[0];
+            }
+            if ($rh_bl->{$ctgid}->{$tsid} && $rh_bl->{$ctgid}->{$tsid}->[1] > $rh_ct->{$ctgid}->{$tsid}->[1]) {
+                $dat{$ctgid}->{$tsid}->[1] = $rh_bl->{$ctgid}->{$tsid}->[1];
+            } else {
+                $dat{$ctgid}->{$tsid}->[1] = $rh_ct->{$ctgid}->{$tsid}->[1];
+            }
+        }
+    }
+    return \%dat;
+}
+
+# accepts blast file
+# foreach query-subject pair will get the lowest boundary and highest boundary
+# returns {contig}->{transcript} = [low,high]
+sub get_bl_boundaries {
+    my $bl = shift;
+    my %bound = ();
+    open(my $fh, "<", $bl);
+    while (my $line = <$fh>) {
+        chomp $line;
+        my @f = split /\t/, $line;
+        my $low = $f[8];
+        my $high = $f[9];
+        if ($low > $high) {
+            $low = $f[9];
+            $high = $f[8];
+        }
+        if ($bound{$f[1]}->{$f[0]}) {
+            if ($bound{$f[1]}->{$f[0]}->[0] > $low) {
+                $bound{$f[1]}->{$f[0]}->[0] = $low
+            }
+            if ($bound{$f[1]}->{$f[0]}->[1] < $high) {
+                $bound{$f[1]}->{$f[0]}->[1] = $high
+            }
+        } else {
+            $bound{$f[1]}->{$f[0]} = [$low,$high];
+        }
+    }
+    return \%bound;
+}
+
+# accepts alien index file
+# returns 2 hashes one for those with AI scores < 50 and other AI > 50
+#  {contig}->{transcript_id} = [contig start,contig_end]
+sub get_ctigs_w_aliens {
+    my $file  = shift;
+    my $rh_o  = shift;
+
+    my %top_ctigs = ();
+    my %low_ctigs = ();
+    open(my $fh, "<", $file);
+    my $topline = <$fh>;
+    while (my $line = <$fh>) {
+        chomp $line;
+        my @f = split /\t/, $line;
+        $f[7] =~ s/^ALIEN_//;
+        my $low = $f[8];
+        my $high = $f[9];
+        if ($low > $high) {
+            $low = $f[9];
+            $high = $f[8];
+        }
+        if ($f[1] >= $rh_o->{'ai_cut'}) {
+            $top_ctigs{$f[7]}->{$f[0]} = [$low,$high];
+        } else {
+            $low_ctigs{$f[7]}->{$f[0]} = [$low,$high];
+        }
+    }
+    return(\%top_ctigs,\%low_ctigs);
+}
+
+sub alien_index {
+    my $fa = shift;
+    my $transcriptome = shift;
+    my $name = shift;
+    my $threads = shift;
+
+    system "makeblastdb -dbtype nucl -in $fa > $name.makeblastdb.stdout 2> $name.makeblastdb.stderr";
+    print "blastn -query $transcriptome -db $fa -outfmt 6 -max_target_seqs 100 -evalue 0.001 -num_threads $threads -out $name.ai.blastn\n";
+    system "blastn -query $transcriptome -db $fa -outfmt 6 -max_target_seqs 100 -evalue 0.001 -num_threads $threads -out $name.ai.blastn";
+    system "$ALIEN_INDEX --blast=$name.ai.blastn --alien_pattern=ALIEN_ > $name.ai";
+    return "$name.ai";
+}
+
+sub add_contig_if_uniq {
+    my $ra_bl      = shift;  # array of arrays (each array split bl line)
+    my $rh_ctg_ts  = shift;  # hash key=contig value=(transcript_id => eval,
+    my $id         = shift;  # id of contig to evaluate
+    my $rh_prim    = shift;  # hash key=contig that has been included val=1
+    my $rh_ts_inc  = shift;
+    my $rh_reject  = shift; 
+    my $max_p_dups = shift;
+
+    my $perc_dups = how_many_duplicates($rh_ts_inc,$rh_ctg_ts,$id);
+    $rh_reject->{$id} = 1 if ($perc_dups > $max_p_dups);
+    return 0 if ($perc_dups > $max_p_dups);
+    add_to_ti($rh_ts_inc,$rh_ctg_ts,$id);
+    $rh_prim->{$id}++;
+    remove_alien_id_in_blast($ra_bl,$id); 
+}
+
+sub how_many_duplicates {
+    my $rh_ti = shift;
+    my $rh_ctg_ts = shift;
+    my $id = shift;
+    my $num_ts_in_ctg = 0;
+    my $total_ts = 0;
+
+    foreach my $ts (keys %{$rh_ctg_ts->{$id}}) {
+        $total_ts++;
+        $num_ts_in_ctg++ if ($rh_ti->{$ts});
+    }
+    my $dup_perc = 0;
+    $dup_perc = $num_ts_in_ctg/$total_ts if ($total_ts);
+    return $dup_perc;
+}
+
+sub add_longest_contig {
+    my $ra_bl         = shift;  # array of arrays (each array split bl line)
+    my $rh_ctg_ts     = shift;  # hash key=contig value={transcript_id => eval,
+    my $id            = shift;  # longest id
+    my $rh_prim       = shift;  # hash key=contig that has been included val=1
+    my $rh_ts_inc     = shift;  # transcripts included in the current prim
+
+    $rh_prim->{$id}++;
+    add_to_ti($rh_ts_inc,$rh_ctg_ts,$id);
+    remove_alien_id_in_blast($ra_bl,$id);
+}
+
+
+
+# if there are multiple blast hits they are within 1 order of mag
+# might be better to set $rh_ti->{$ts} = 1 rather than $eval
+sub add_to_ti {
+    my $rh_ti = shift;
+    my $rh_ctg_ts = shift;
+    my $id = shift;
+
+    if (!$rh_ctg_ts->{$id}) { # no transcripts map to contig
+        push @CONTIGS_W_NO_TRANSCRIPTS, $id;
+        return;
+    }
+    
+    foreach my $ts (keys %{$rh_ctg_ts->{$id}}) {
+        $rh_ti->{$ts}++;
+    }
+}
+
+sub orders_of_mag_diff {
+    my $n1 = shift;
+    my $n2 = shift;
+    my ($one_n1,$oom_n1) = get_orders_of_mag($n1);
+    my ($one_n2,$oom_n2) = get_orders_of_mag($n2);
+    my $diff = 0;
+    if ($one_n1 == $one_n2) {
+        $diff = $oom_n1 - $oom_n2;
+        $diff *= -1 if ($diff < 0);
+        return $diff;
+    } else {
+        $diff = $oom_n1 + $oom_n2 - 1;
+    }
+    return $diff;
+}
+
+sub get_orders_of_mag {
+    my $xx = shift;
+    if ($xx =~ m/^\s*[0-9\.]*[eE]-(\d+)\s*$/) {
+        return(0,$1);
+    } elsif ($xx =~ m/^\s*\d*\.(\d+)\s*$/) {
+        my $val = $1;
+        $val =~ s/0+$//;
+        my $oom = length($val);
+        return(0,$oom);
+    } elsif ($xx =~ m/^\s*([0-9]+)\s*$/) {
+        my $oom = length($1);
+        return(1,$oom);
+    } else {
+        die "unexpected: $xx";
+    }
+}
+
+sub print_ai_fasta {
+    my $rh_prim = shift;
+    my $rh_rej  = shift;
+    my $rh_fa   = shift;
+    my $fh      = shift;
+    foreach my $id (keys %{$rh_prim}) {
+        warn "no seq for $id" unless ($rh_fa->{$id});
+        next unless ($rh_fa->{$id});
+        print $fh ">$id\n$rh_fa->{$id}\n";
+    }
+    foreach my $id (keys %{$rh_rej}) {
+        warn "no seq for $id" unless ($rh_fa->{$id});
+        next unless ($rh_fa->{$id});
+        print $fh ">ALIEN_$id\n$rh_fa->{$id}\n";
+    }
+}
+
+sub print_fasta {
+    my $rh_prim = shift;
+    my $rh_fa   = shift;
+    my $fh      = shift;
+    foreach my $id (keys %{$rh_prim}) {
+        warn "no seq for $id" unless ($rh_fa->{$id});
+        next unless ($rh_fa->{$id});
+        print $fh ">$id\n$rh_fa->{$id}\n";
+    }
+}
+
+sub remove_alien_id_in_blast {
+    my $ra_bl = shift;
+    my $id = shift;
+    foreach my $ra_b (@{$ra_bl}) {
+        next unless ($ra_b->[0] eq $id || $ra_b->[1] eq $id);
+        $ra_b->[1] =~ s/^ALIEN_$id$/$id/g;
+    }
+}
+
+sub get_blast_array {
+    my $rh_o = shift;
+
+    my $bl           = $rh_o->{'blast'};
+    my $max_oom_diff = $rh_o->{'max_oom_diff'};
+
+    my @blast = ();
+    my %ctg_ts = ();
+    my %top_eval = (); #store top eval of each transcript (key = ts:val=eval)
+    open(my $fh, "<", $bl);
+    LINE: while (my $line = <$fh>) {
+        chomp $line;
+        my @f = split /\t/, $line;
+        if ($top_eval{$f[0]}) {
+            my $oom_diff = orders_of_mag_diff($f[10],$top_eval{$f[0]});
+            next LINE unless ( ($f[10] == $top_eval{$f[0]}) || 
+                          ($oom_diff < $max_oom_diff) );
+        } else {
+            $top_eval{$f[0]} = $f[10];
+        }
+        $f[10] = 1e-2000 if ($f[10] == 0);
+        $ctg_ts{$f[1]}->{$f[0]} = $f[10] if (!$ctg_ts{$f[1]}->{$f[0]} || $ctg_ts{$f[1]}->{$f[0]} > $f[10]);
+        $f[1] =~ s/^/ALIEN_/;
+        push @blast, \@f;
+    }
+    return(\@blast,\%ctg_ts);
+}
+
+sub get_rejected {
+    my $rh_rej_fa = shift;
+    my $rh_prim = shift;
+    my $rh_rejlen = shift;
+    my %rejected = ();
+
+    my $rh_rej_ids_coords = get_ids_and_coords_of_partials($rh_prim);
+    my %coords = ();
+    REJ: foreach my $id (keys %{$rh_rej_fa}) {
+        if ($rh_rej_ids_coords->{$id}) {
+            my $len = $rh_rejlen->{$id};
+            my $index = '';
+            my @sorted = sort {$a->[0] <=> $b->[0]} @{$rh_rej_ids_coords->{$id}};
+            if ($sorted[0]->[0] != 1) {
+                $coords{$id}->[0]->[0] = 1;
+                $coords{$id}->[0]->[1] = $sorted[0]->[0] - 1;
+            }
+            next REJ if ($sorted[0]->[1] == $len);
+            $index = $sorted[0]->[1] + 1;
+            shift @sorted;
+            foreach my $ra_c (@sorted) {
+                push @{$coords{$id}}, [$index,($ra_c->[0] - 1)];
+                next REJ if ($ra_c->[1] == $len);
+                $index = $ra_c->[1] + 1;
+            }
+        } else {
+            $rejected{$id} = $rh_rej_fa->{$id};
+        }
+    }
+    foreach my $id (keys %coords) {
+        foreach my $ra_co (@{$coords{$id}}) {
+            my $subid = $id . '.' . $ra_co->[0] . '-' . $ra_co->[1];
+            my $len = $ra_co->[1] - $ra_co->[0];
+            my $seq = substr $rh_rej_fa->{$id}, ($ra_co->[0] - 1), $len;
+            $rejected{$subid} = $seq;
+        }
+    }
+    return \%rejected;
+}
+
+sub get_ids_and_coords_of_partials {
+    my $rh_prim = shift;
+    my %ic = ();
+    foreach my $key (keys %{$rh_prim}) {
+        # we only care about partials (not all are partials)
+        push @{$ic{$1}}, [$2,$3] if ($key =~ m/^([^\.]+)\.(\d+)-(\d+)/);
+    }
+    return \%ic;
+}
+
+sub print_fasta_direct {
+    my $rh_prim   = shift;
+    my $fh        = shift;
+    foreach my $id (keys %{$rh_prim}) {
+        print $fh ">$id\n$rh_prim->{$id}\n";
+    }
+}
+
+sub get_seqs {
+    my $rh_chunks = shift;
+    my $rh_fa     = shift;
+    my $rh_len    = shift;
+    my $rh_orig_fa = shift;
+    my $rh_o       = shift;
+
+    my %primary = ();
+    my $end_pad = $rh_o->{'end_pad'};
+
+    foreach my $ctgid (keys %{$rh_chunks}) {
+        foreach my $ra_coords (@{$rh_chunks->{$ctgid}}) {
+            $ra_coords->[1] += $end_pad unless ($ra_coords->[1] == $rh_len->{$ctgid});
+            $ra_coords->[0] -= $end_pad unless ($ra_coords->[0] == 1);
+            my $len = $ra_coords->[1] - $ra_coords->[0];
+            my $seq = substr $rh_fa->{$ctgid}, ($ra_coords->[0] - 1), $len;
+            my $def = $ctgid . '.';
+            $def .= $ra_coords->[0] . '-' . $ra_coords->[1];
+            $primary{$def} = $seq;
+        }
+    }
+    foreach my $id (keys %{$rh_orig_fa}) {
+        die "unexpected repeat: $id\n" if ($primary{$id});
+        $primary{$id} = $rh_orig_fa->{$id};
+    }
+    return(\%primary);
+}
+
+sub within_jdist_from_three_prime {
+    my $ctg_len = shift;
+    my $high    = shift;
+    my $joindist = shift;
+    return 1 if ( ($ctg_len - $high) <= $joindist);
+    return 0;
+}
+
+sub debug {
+    my $rh_bl_boundaries = shift;
+    my $rh_dat           = shift;
+    my $rh_rej_fa        = shift;
+    my $rh_rejlens       = shift;
+    my $rh_orig_fa       = shift;
+    my $rh_orig_lens     = shift;
+    my $rh_chunks        = shift;
+    my $rh_prim          = shift;
+    my $rh_rej           = shift;
+
+    print_key_count($rh_bl_boundaries,'$rh_bl_boundaries');
+    print_key_count($rh_dat,'$rh_dat');
+    print_key_count($rh_rej_fa,'$rh_rej_fa');
+    print_key_count($rh_rejlens,'$rh_rejlens');
+    print_key_count($rh_orig_fa,'$rh_orig_fa');
+    print_key_count($rh_orig_lens,'$rh_orig_lens');
+    print_key_count($rh_chunks,'$rh_chunks');
+    print_key_count($rh_prim,'$rh_prim');
+    print_key_count($rh_rej,'$rh_rej');
+}
+
+# routine for debugging (called by debug sub)
+sub print_key_count {
+    require Hash::MD5;
+    my $rh_h = shift;
+    my $name = shift;
+    my $count = scalar(keys(%{$rh_h}));
+    print "KEYCOUNT: $name: $count - ";
+    print Hash::MD5::sum( $rh_h ), $/;
+}
+
+sub process_options {
+    my $rh_o = {};
+    my $opt_results = Getopt::Long::GetOptions(
+                      "version" => \$rh_o->{'version'},
+                  "join_dist=i" => \$rh_o->{'joindist'},
+                    "end_pad=i" => \$rh_o->{'end_pad'},
+                       "name=s" => \$rh_o->{'name'},
+                 "max_p_dups=f" => \$rh_o->{'max_p_dups'},
+                     "ai_cut=i" => \$rh_o->{'ai_cut'},
+                      "blast=s" => \$rh_o->{'blast'},
+                     "ctg_fa=s" => \$rh_o->{'ctg_fa'},
+              "transcriptome=s" => \$rh_o->{'transcriptome'},
+               "max_oom_diff=i" => \$rh_o->{'max_oom_diff'},
+                    "threads=i" => \$rh_o->{'threads'},
+                        "debug" => \$rh_o->{'debug'},
+                      "verbose" => \$rh_o->{'verbose'},
+                         "help" => \$rh_o->{'help'});
+    die "no_transcript_left_behind v.$VERSION\n" if ($rh_o->{'version'});
+    pod2usage({-exitval => 0, -verbose => 2}) if ($rh_o->{'help'});
+    $rh_o->{'joindist'}     = $DF_JOINDIST     unless ($rh_o->{'joindist'});
+    $rh_o->{'end_pad'}      = $DF_END_PAD      unless ($rh_o->{'end_pad'});
+    $rh_o->{'max_p_dups'}   = $DF_MAX_P_DUPS   unless ($rh_o->{'max_p_dups'} || $rh_o->{'max_p_dups'} == 0);
+    $rh_o->{'ai_cut'}       = $DF_AI_CUT       unless ($rh_o->{'ai_cut'});
+    $rh_o->{'max_oom_diff'} = $DF_MAX_OOM_DIFF unless ($rh_o->{'max_oom_diff'});
+    $rh_o->{'threads'}      = $DF_THREADS      unless ($rh_o->{'threads'});
+    $rh_o->{'ctg_fa'}        || usage();
+    $rh_o->{'transcriptome'} || usage();
+    $rh_o->{'blast'}         || usage();
+    $rh_o->{'name'}          || usage();
+
+    return $rh_o;
+}
+
+sub usage {
+    print "no_transcript_left_behind --ctg_fa=FASTA --transcriptome=FASTA --blast=TABBED_BLAST --name=NAME_FOR_OUTPUT [--threads=INTEGER] [--joindist=INTEGER] [--end_pad=INTEGER] [--max_p_dups=FLOAT] [--ai_cut=INTEGER] [--max_oom_diff=INTEGER] [--help] [--version]\n";
+}
+
+__END__ 
+
+=head1 NAME
+
+B<no_transcript_left_behind> - use transcriptome to build haplotig-merged assembly 
+
+=head1 AUTHOR
+
+Joseph F. Ryan <joseph.ryan@whitney.ufl.edu>
+
+=head1 SYNOPSIS
+
+no_transcript_left_behind --transcriptome=FASTA --blast=TABBED_BLAST --name=NAME_FOR_OUTPUT [--joindist=INTEGER] [--end_pad=INTEGER] [--max_p_dups=FLOAT] [--ai_cut=INTEGER] [--min_ai=INTEGER] [--max_ai=INTEGER] [--ctg_fa=]
+
+=head1 DESCRIPTION
+
+program does the following:
+(1) build set of contigs (prioritized on length) that have no duplicate transcripts
+(2) BLASTs transcripts vs a db that includes incorporated and non-incorporated contigs
+(3) use alien_index_print_hit to identify transcripts that have better hits in the non-incorporated contigs
+(4) incorporate into the main assembly parts of the non-incorporated contigs that have missing transcripts
+
+=head1 OPTIONS
+
+=over 2
+
+=item B<--ctg_fa>
+
+all genomic contigs
+
+=item B<--transcriptome>
+
+(near complete) Transcriptome used to pick contigs
+
+=item B<--blast>
+
+BLASTN of transcriptome (--blast) vs. all genomic contigs (--ctg_fa)
+(blastn -query transcriptome -db genomic_contigs -outfmt 6 -max_target_seqs 100 -evalue 0.001)
+
+=item B<--name>
+
+NAME for output files
+
+=item B<--joindist>
+
+max distance between two matches to merge regions 
+when identifying parts of contigs to incorporate in main assembly
+
+default: 10000
+
+=item B<--end_pad>
+
+incorporate up to the end of contig if this many or fewer NTs from end
+when identifying parts of contigs to incorporate in main assembly
+
+default: 2000
+
+=item B<--max_p_dups>
+
+percentage of allowable duplications when compiling first set of 
+contigs to incorporate into main assembly
+
+default: 0.0
+
+=item B<--ai_cut>
+
+cutoff for alien index when comparing after 
+
+default: 45 
+
+=back
+
+=head1 COPYRIGHT
+
+Copyright (C) 2018 Joseph F. Ryan
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+=cut
+
