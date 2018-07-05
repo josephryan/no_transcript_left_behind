@@ -1,0 +1,223 @@
+#!/usr/bin/perl
+
+eval 'exec /usr/bin/perl  -S $0 ${1+"$@"}'
+    if 0; # not running under some shell
+
+use strict;
+use warnings; 
+use Getopt::Long;
+use Pod::Usage;
+use Data::Dumper;
+
+# algorithm is based on algorithm described in the following:
+#  Gladyshev, Eugene A., Matthew Meselson, and Irina R. Arkhipova.
+#  "Massive horizontal gene transfer in bdelloid rotifers."
+#  science 320.5880 (2008): 1210-1213.
+
+our $VERSION = 3.00;
+our $AUTHOR  = 'Joseph F. Ryan <joseph.ryan@whitney.ufl.edu>';
+
+MAIN: {
+    my $rh_opts  = process_options();
+    my $rh_blast = get_blast($rh_opts->{'blast'},$rh_opts->{'alien_pattern'});
+    my ($rh_ai,$rh_hi) = get_indices($rh_blast,$rh_opts->{'alien_pattern'});
+    print_sorted_ai($rh_ai,$rh_hi);
+}
+
+sub print_sorted_ai {
+    my $rh_ai = shift;
+    my $rh_hi = shift;
+    print "ID\tAI\tbest E-Val\tbest non-alien E-val\tHI\tcontig start\tcontig end\n";
+    foreach my $id (sort {$rh_ai->{$b}->{'ai'} <=> $rh_ai->{$a}->{'ai'}} 
+                    keys %{$rh_ai}) {
+        print "$id\t$rh_ai->{$id}->{'ai'}\t$rh_ai->{$id}->{'alien_eval'}\t";
+        print "$rh_ai->{$id}->{'non_alien_eval'}\t";
+        print "$rh_hi->{$id}->{'hi'}\t$rh_hi->{$id}->{'alien_bitscore'}\t";
+        print "$rh_hi->{$id}->{'non_alien_bitscore'}\t$rh_ai->{$id}->{'alien_id'}\t$rh_ai->{$id}->{'ctg_start'}\t$rh_ai->{$id}->{'ctg_end'}\n";
+    }
+}
+
+# formula from Gladyshev et al. 2008.
+sub calc_ai {
+    my $nm_val = shift;
+    my $m_val = shift;
+    my $ai = log(($m_val) + 1e-200) - log(($nm_val) + 1e-200);
+    return $ai;
+}
+
+sub calc_hi {
+    my $nm_val = shift;
+    my $m_val = shift;
+    my $hi = $nm_val - $m_val;
+    return $hi;
+}
+
+sub get_indices {
+    my $rh_bl = shift;
+    my $alien_pattern = shift;
+    my %ai_indices = ();
+    my %hi_indices = ();
+    foreach my $id (keys %{$rh_bl}) {
+        my $ra_f1     = shift @{$rh_bl->{$id}};
+        my $alien_id  = $ra_f1->[1];
+        my $ctg_start = $ra_f1->[8];
+        my $ctg_end   = $ra_f1->[9];
+        HIT: foreach my $ra_fields (@{$rh_bl->{$id}}) {
+            next if ($ra_fields->[1] =~ m/$alien_pattern/);
+            my $ai = calc_ai($ra_f1->[10],$ra_fields->[10]);
+            $ai_indices{$id} = {'alien_eval' => $ra_f1->[10],
+                                'alien_id' => $alien_id,
+                                'ctg_start' => $ctg_start,,
+                                'ctg_end' => $ctg_end,
+                                'non_alien_eval' => $ra_fields->[10],
+                                'ai' => $ai};
+            my $hi = calc_hi($ra_f1->[11],$ra_fields->[11]);
+            $hi_indices{$id} = {'alien_bitscore' => $ra_f1->[11],
+                                'non_alien_bitscore' => $ra_fields->[11],
+                                'hi' => $hi};
+            last HIT;
+        }
+        unless ($ai_indices{$id}) {
+            my $ai = calc_ai($ra_f1->[10],1);
+            $ai_indices{$id} = {'alien_eval' => $ra_f1->[10],
+                                'alien_id' => $alien_id,
+                                'ctg_start' => $ctg_start,,
+                                'ctg_end' => $ctg_end,
+                                'non_alien_eval' => 'no hits',
+                                'ai' => $ai};
+        }
+        unless ($hi_indices{$id}) {
+            my $hi = calc_hi($ra_f1->[10],0);
+            $hi_indices{$id} = {'alien_bitscore' => $ra_f1->[11],
+                                'alien_id' => $alien_id,
+                                'ctg_start' => $ctg_start,,
+                                'ctg_end' => $ctg_end,
+                                'non_alien_bitscore' => 'no hits',
+                                'hi' => $hi};
+        }
+    }
+    return (\%ai_indices,\%hi_indices);
+}
+
+sub get_blast {
+    my $blast = shift;
+    my $alien_pattern = shift;
+    my %data  = ();
+    my %not_contam  = ();
+    open IN, $blast or die "cannot open $blast:$!";
+    while (my $line = <IN>) {
+        chomp $line;
+        my @fields = split /\t/, $line;
+        next if ($not_contam{$fields[0]});
+        if (!$data{$fields[0]} && ($fields[1] !~ m/$alien_pattern/) ) {
+            $not_contam{$fields[0]}++;
+            next;
+        }
+        push @{$data{$fields[0]}}, \@fields;
+    }
+    return \%data;
+}
+
+sub usage {
+    die "usage: $0 --blast=BLASTREPORT --alien_pattern=PATTERN_IN_ALIEN_DEFLINES [--version] [--help]\n";
+}
+
+sub process_options {
+    my $rh_opts = {};
+    $rh_opts->{'blast'} = '';
+    my $opt_results = Getopt::Long::GetOptions(
+                              'version' => \$rh_opts->{'version'},
+                      'alien_pattern=s' => \$rh_opts->{'alien_pattern'},
+                              'blast=s' => \$rh_opts->{'blast'},
+                                 'help' => \$rh_opts->{'help'});
+    die "$VERSION\n" if ($rh_opts->{'version'});
+    pod2usage({-exitval => 0, -verbose => 2}) if $rh_opts->{'help'};
+    usage() unless ($rh_opts->{'blast'});
+    return $rh_opts;
+}
+
+__END__
+
+=head1 NAME
+
+B<alien_index> - identify non-animal sequence in animal transcriptomes
+
+=head1 AUTHOR
+
+Joseph F. Ryan <joseph.ryan@whitney.ufl.edu>
+
+=head1 SYNOPSIS
+
+=head1 OPTIONS
+
+=item B<--blast>
+
+BLAST report run with -outfmt 6 
+
+=item B<--alien_pattern>
+
+a pattern that appears in 
+
+=item B<--help>
+
+Print this manual
+
+=item B<--version>
+
+Print the version. Overrides all other options.
+
+=back
+
+=head1 DESCRIPTION
+
+Generates a measure (alien index) which measures by how many orders of magnitude the BLAST E-value for the best non-alien hit differs from that for the best alien hit.  Examples of non-alien and alien are: (metazoan and non-metazoan; plant and non-plant; non-nematodes and nematodes--if for example you expected nematode contamination).
+
+=head1 STEP-BY-STEP
+
+1. Create a FASTA database of non-alien sequences (e.g., representative animal protein sequences) (NOTE: nucleotide sequences would work too)
+    * an example database (meta.fa.gz) is available here: http://ryanlab.whitney.ufl.edu/downloads/alien_index/
+
+2. Create a FASTA database of alien sequences (e.g., representative non-animal protein sequences; e.g., bacteria, non-metazoan euks, archae)
+    * an example database (non_meta.fa.gz) is available here: http://ryanlab.whitney.ufl.edu/downloads/alien_index/
+
+3. Add unique code to definition line of all alien sequences. For
+       example:
+
+    perl -pi -e 's/^>/>ALIEN_/' non_meta.fa
+
+4. Make sure that your unique code is not found in your non-alien fasta
+
+    grep '^>' meta.fa | grep ALIEN_
+
+5. create BLAST database. For example:
+
+    cat non_meta.fa meta.fa > ai.fa
+    
+    makeblastdb -dbtype prot -in ai.fa
+
+6. BLAST query sequences (e.g., transcriptome) against combined db. Be sure to use -outfmt 6 (tabbed). For example:
+
+    blastx -query myseqs.fa -db ai.fa -outfmt 6 -max_target_seqs 1000 -seg yes -evalue 0.001 -out myseqs_v_ai.blastx
+
+7. Run alien_index
+
+    alien_index --blast=myseqs_v_ai.blastx --alien_pattern=ALIEN_ > myseqs.alien_index
+
+=head1 COPYRIGHT
+
+Copyright (C) 2016, Joseph F. Ryan
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+=cut
