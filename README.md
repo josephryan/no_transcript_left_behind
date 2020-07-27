@@ -1,6 +1,8 @@
 # no_transcript_left_behind
 use transcriptome to build haplotig-merged assembly
 
+# Experimental code. Not recommended for production, but maybe useful to anyone exploring using transcriptome information to tease apart haplotigs from long-read assemblies.
+
 ## NAME
 
 B<no_transcript_left_behind> - use transcriptome to build haplotig-merged assembly 
